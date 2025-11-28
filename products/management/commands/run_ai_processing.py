@@ -29,8 +29,9 @@ class Command(BaseCommand):
         batch_size = options['batch_size']
         continuous = options['continuous']
         
-        if batch_size not in [10, 20]:
-            self.stdout.write(self.style.ERROR('Batch size must be 10 or 20'))
+        allowed_sizes = [10, 15, 20, 25, 30]
+        if batch_size not in allowed_sizes:
+            self.stdout.write(self.style.ERROR(f'Batch size must be one of {allowed_sizes}'))
             return
         
         if continuous:
@@ -106,7 +107,6 @@ class Command(BaseCommand):
     
     def process_batch(self, batch, products):
         """Process a batch of products with AI"""
-        attributes = list(Attribute.objects.all())
         ai_providers = list(AIProvider.objects.filter(is_active=True))
         
         if not ai_providers:
@@ -121,7 +121,11 @@ class Command(BaseCommand):
             # Simulate processing time
             time.sleep(2)
             
-            for attribute in attributes:
+            applicable_attributes = list(product.get_applicable_attributes())
+            if not applicable_attributes:
+                continue
+            
+            for attribute in applicable_attributes:
                 # Get suggestions from each provider
                 for provider in ai_providers:
                     suggested_value = self.generate_ai_suggestion(product, attribute, provider)
@@ -144,7 +148,7 @@ class Command(BaseCommand):
                 suggestions = AISuggestion.objects.filter(product=product, attribute=attribute)
                 if suggestions:
                     consensus_value = self.build_consensus(suggestions)
-                    AIConsensus.objects.create(
+                    AIConsensus.record(
                         product=product,
                         attribute=attribute,
                         consensus_value=consensus_value,

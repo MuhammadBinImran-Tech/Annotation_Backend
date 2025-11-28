@@ -1,10 +1,26 @@
 from django.contrib import admin
 from .models import *
 
+
+@admin.register(Category)
+class CategoryAdmin(admin.ModelAdmin):
+    list_display = ['name', 'created_at']
+    search_fields = ['name']
+    readonly_fields = ['created_at', 'updated_at']
+
+
+@admin.register(SubCategory)
+class SubCategoryAdmin(admin.ModelAdmin):
+    list_display = ['name', 'category', 'created_at']
+    list_filter = ['category']
+    search_fields = ['name', 'category__name']
+    readonly_fields = ['created_at', 'updated_at']
+
+
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display = ['name', 'external_sku', 'category', 'status', 'created_at']
-    list_filter = ['status', 'category', 'created_at']
+    list_display = ['name', 'external_sku', 'category', 'subcategory', 'status', 'created_at']
+    list_filter = ['status', 'category', 'subcategory', 'created_at']
     search_fields = ['name', 'external_sku', 'description']
     readonly_fields = ['created_at', 'updated_at']
 
@@ -12,6 +28,13 @@ class ProductAdmin(admin.ModelAdmin):
 class AttributeAdmin(admin.ModelAdmin):
     list_display = ['name', 'data_type', 'created_at']
     list_filter = ['data_type']
+    readonly_fields = ['created_at', 'updated_at']
+
+@admin.register(CategoryAttributeMapping)
+class CategoryAttributeMappingAdmin(admin.ModelAdmin):
+    list_display = ['category', 'subcategory', 'attribute', 'is_required', 'created_at']
+    list_filter = ['category', 'subcategory', 'is_required']
+    search_fields = ['category__name', 'subcategory__name', 'attribute__name']
     readonly_fields = ['created_at', 'updated_at']
 
 @admin.register(AIProvider)

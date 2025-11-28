@@ -1,11 +1,46 @@
 from django.core.management.base import BaseCommand
 from django.contrib.auth.models import User, Group
-from products.models import Product, Attribute
+from products.models import (
+    Product,
+    Attribute,
+    Category,
+    SubCategory,
+    CategoryAttributeMapping,
+)
 
 class Command(BaseCommand):
     help = 'Setup sample data for testing with 100 products'
-    
+
     def handle(self, *args, **options):
+        category_cache = {}
+        subcategory_cache = {}
+
+        def normalize(value):
+            if not value:
+                return None
+            value = value.strip()
+            return value or None
+
+        def get_category(name):
+            name = normalize(name)
+            if not name:
+                return None
+            if name not in category_cache:
+                category_cache[name], _ = Category.objects.get_or_create(name=name)
+            return category_cache[name]
+
+        def get_subcategory(category, name):
+            name = normalize(name)
+            if not category or not name:
+                return None
+            cache_key = (category.id, name)
+            if cache_key not in subcategory_cache:
+                subcategory_cache[cache_key], _ = SubCategory.objects.get_or_create(
+                    category=category,
+                    name=name
+                )
+            return subcategory_cache[cache_key]
+        
         # Create groups
         admin_group, _ = Group.objects.get_or_create(name='Admin')
         annotator_group, _ = Group.objects.get_or_create(name='Annotator')
@@ -51,6 +86,13 @@ class Command(BaseCommand):
             {'name': 'Pattern', 'data_type': 'enum', 'allowed_values': ['Solid', 'Striped', 'Printed', 'Floral', 'Checkered', 'Plaid', 'Polka Dot', 'Animal Print', 'Geometric', 'Abstract', 'Paisley', 'Tie-Dye', 'Camouflage', 'Houndstooth', 'Herringbone']},
             {'name': 'Occasion', 'data_type': 'enum', 'allowed_values': ['Casual', 'Formal', 'Business', 'Sports', 'Beach', 'Party', 'Wedding', 'Evening', 'Vacation', 'Everyday']},
             {'name': 'Care Instructions', 'data_type': 'enum', 'allowed_values': ['Machine Wash', 'Hand Wash', 'Dry Clean Only', 'Tumble Dry', 'Line Dry', 'Do Not Bleach', 'Iron Low Heat']},
+            {'name': 'Shoe Size', 'data_type': 'enum', 'allowed_values': ['5', '5.5', '6', '6.5', '7', '7.5', '8', '8.5', '9', '9.5', '10', '10.5', '11', '11.5', '12', '12.5', '13', '14']},
+            {'name': 'Heel Height', 'data_type': 'enum', 'allowed_values': ['Flat', '1 inch', '2 inches', '3 inches', '4 inches', '5+ inches']},
+            {'name': 'Closure Type', 'data_type': 'enum', 'allowed_values': ['Slip-On', 'Lace-Up', 'Buckle', 'Velcro', 'Zipper', 'Button', 'Hook-and-Loop']},
+            {'name': 'Strap Style', 'data_type': 'enum', 'allowed_values': ['Crossbody', 'Shoulder', 'Top Handle', 'Backpack', 'Clutch', 'Wristlet', 'Messenger']},
+            {'name': 'Metal Type', 'data_type': 'enum', 'allowed_values': ['Gold', 'White Gold', 'Rose Gold', 'Silver', 'Platinum', 'Stainless Steel', 'Titanium']},
+            {'name': 'Stone Type', 'data_type': 'enum', 'allowed_values': ['Diamond', 'Cubic Zirconia', 'Sapphire', 'Emerald', 'Ruby', 'Pearl', 'Amethyst', 'Topaz', 'Opal']},
+            {'name': 'Frame Shape', 'data_type': 'enum', 'allowed_values': ['Aviator', 'Round', 'Cat Eye', 'Square', 'Rectangle', 'Wayfarer', 'Oversized']},
         ]
         
         for attr_data in attributes_data:
@@ -60,6 +102,50 @@ class Command(BaseCommand):
             )
             if created:
                 self.stdout.write(self.style.SUCCESS(f'Created attribute: {attribute.name}'))
+
+        # Map attributes to categories/subcategories
+        attribute_lookup = {attr.name: attr for attr in Attribute.objects.all()}
+        category_attribute_map = {
+            ('Clothing', None): ['Color', 'Size', 'Material', 'Fit', 'Pattern', 'Season', 'Occasion', 'Care Instructions'],
+            ('Clothing', 'T-Shirts'): ['Sleeve Length', 'Neckline'],
+            ('Clothing', 'Dresses'): ['Sleeve Length', 'Neckline'],
+            ('Clothing', 'Sweaters'): ['Sleeve Length', 'Neckline'],
+            ('Clothing', 'Hoodies'): ['Sleeve Length'],
+            ('Clothing', 'Jackets'): ['Sleeve Length'],
+            ('Clothing', 'Coats'): ['Sleeve Length'],
+            ('Clothing', 'Blouses'): ['Sleeve Length', 'Neckline'],
+            ('Footwear', None): ['Color', 'Material', 'Pattern', 'Season', 'Occasion', 'Care Instructions', 'Closure Type', 'Shoe Size', 'Heel Height'],
+            ('Footwear', 'Sneakers'): ['Closure Type', 'Shoe Size'],
+            ('Footwear', 'Boots'): ['Closure Type', 'Heel Height'],
+            ('Footwear', 'Heels'): ['Heel Height', 'Closure Type'],
+            ('Accessories', None): ['Color', 'Material', 'Pattern', 'Occasion'],
+            ('Accessories', 'Bags'): ['Strap Style', 'Closure Type'],
+            ('Accessories', 'Jewelry'): ['Metal Type', 'Stone Type'],
+            ('Accessories', 'Watches'): ['Strap Style', 'Closure Type', 'Metal Type'],
+            ('Accessories', 'Hats'): ['Size'],
+            ('Accessories', 'Belts'): ['Size'],
+            ('Accessories', 'Gloves'): ['Size', 'Material'],
+            ('Accessories', 'Sunglasses'): ['Frame Shape', 'Material'],
+        }
+
+        created_mappings = 0
+        for (category_name, subcategory_name), attr_names in category_attribute_map.items():
+            category_obj = get_category(category_name)
+            subcategory_obj = get_subcategory(category_obj, subcategory_name)
+            for attr_name in attr_names:
+                attribute = attribute_lookup.get(attr_name)
+                if not attribute:
+                    continue
+                _, created = CategoryAttributeMapping.objects.get_or_create(
+                    category=category_obj,
+                    subcategory=subcategory_obj,
+                    attribute=attribute,
+                    defaults={'is_required': True}
+                )
+                if created:
+                    created_mappings += 1
+        if created_mappings:
+            self.stdout.write(self.style.SUCCESS(f'Created {created_mappings} category-attribute mappings'))
         
         # Create 100 sample products with Unsplash images
         products_data = [
@@ -994,9 +1080,16 @@ class Command(BaseCommand):
         ]
         
         for product_data in products_data:
+            category_obj = get_category(product_data.get('category'))
+            subcategory_obj = get_subcategory(category_obj, product_data.get('subcategory'))
+            creation_defaults = {
+                **product_data,
+                'category': category_obj,
+                'subcategory': subcategory_obj,
+            }
             product, created = Product.objects.get_or_create(
                 external_sku=product_data['external_sku'],
-                defaults=product_data
+                defaults=creation_defaults
             )
             if created:
                 self.stdout.write(self.style.SUCCESS(f'Created product: {product.name}'))

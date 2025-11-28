@@ -2,14 +2,34 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.contrib.auth.models import User, Group
-from django.db.models import Q, Count, Avg
+from django.db.models import Q, Count, Avg, Max
 from django.utils import timezone
-from django.db import transaction
+from django.db import transaction, close_old_connections
 import random
 import threading
 import time
 from .models import *
 from .serializers import *
+
+
+def _is_attribute_applicable(product, attribute_id):
+    attr_ids = CategoryAttributeMapping.get_attribute_ids_for_product(product)
+    if not attr_ids:
+        return True
+    return attribute_id in attr_ids
+
+
+def _required_attribute_ids(product):
+    required_ids = CategoryAttributeMapping.get_attribute_ids_for_product(
+        product,
+        required_only=True
+    )
+    if required_ids:
+        return required_ids
+    mapped_ids = CategoryAttributeMapping.get_attribute_ids_for_product(product)
+    if mapped_ids:
+        return mapped_ids
+    return list(Attribute.objects.values_list('id', flat=True))
 
 class IsAdmin(permissions.BasePermission):
     def has_permission(self, request, view):
@@ -50,24 +70,58 @@ class AnnotationBatchViewSet(viewsets.ModelViewSet):
     queryset = AnnotationBatch.objects.all()
     serializer_class = AnnotationBatchSerializer
     permission_classes = [permissions.IsAuthenticated]
+    summary_actions = {'list', 'ai_batches', 'human_batches', 'unassigned_batches'}
+
+    def _get_list_limit(self, request, default=10, max_limit=50):
+        try:
+            limit = int(request.query_params.get('limit', default))
+        except (TypeError, ValueError):
+            limit = default
+        return max(1, min(limit, max_limit))
+
+    def get_serializer_class(self):
+        if self.action in self.summary_actions:
+            return AnnotationBatchSummarySerializer
+        return super().get_serializer_class()
     
     def get_queryset(self):
+        qs = AnnotationBatch.objects.select_related('assigned_to')
+        if self.action in self.summary_actions:
+            qs = qs.annotate(
+                item_count=Count('items', distinct=True),
+                completed_count=Count('items', filter=Q(items__status='done'), distinct=True),
+            )
+        else:
+            qs = qs.prefetch_related(
+                'items__product__category',
+                'items__product__subcategory',
+            )
         user = self.request.user
         if user.groups.filter(name='Admin').exists():
-            return AnnotationBatch.objects.all()
+            return qs
         elif user.groups.filter(name='Annotator').exists():
-            return AnnotationBatch.objects.filter(assigned_to=user, batch_type='human')
+            return qs.filter(assigned_to=user, batch_type='human')
         return AnnotationBatch.objects.none()
     
     @action(detail=False, methods=['get'], permission_classes=[IsAdmin])
     def ai_batches(self, request):
-        batches = AnnotationBatch.objects.filter(batch_type='ai')
+        limit = self._get_list_limit(request)
+        batches = (
+            self.get_queryset()
+            .filter(batch_type='ai')
+            .order_by('-created_at')[:limit]
+        )
         serializer = self.get_serializer(batches, many=True)
         return Response(serializer.data)
     
     @action(detail=False, methods=['get'], permission_classes=[IsAdmin])
     def human_batches(self, request):
-        batches = AnnotationBatch.objects.filter(batch_type='human')
+        limit = self._get_list_limit(request)
+        batches = (
+            self.get_queryset()
+            .filter(batch_type='human')
+            .order_by('-created_at')[:limit]
+        )
         serializer = self.get_serializer(batches, many=True)
         return Response(serializer.data)
     
@@ -76,8 +130,9 @@ class AnnotationBatchViewSet(viewsets.ModelViewSet):
         """Start automated AI processing - processes all pending products in batches"""
         batch_size = request.data.get('batch_size', 10)
         
-        if batch_size not in [10, 20]:
-            return Response({"error": "batch_size must be 10 or 20"}, status=400)
+        allowed_sizes = [10, 15, 20, 25, 30]
+        if batch_size not in allowed_sizes:
+            return Response({"error": f"batch_size must be one of {allowed_sizes}"}, status=400)
         
         pending_count = Product.objects.filter(status='pending_ai').count()
         
@@ -243,7 +298,12 @@ class AnnotationBatchViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], permission_classes=[IsAdmin])
     def unassigned_batches(self, request):
         """Get all unassigned human batches"""
-        batches = AnnotationBatch.objects.filter(batch_type='human', assigned_to__isnull=True, status='pending')
+        limit = self._get_list_limit(request, default=25)
+        batches = (
+            self.get_queryset()
+            .filter(batch_type='human', assigned_to__isnull=True, status='pending')
+            .order_by('-created_at')[:limit]
+        )
         serializer = self.get_serializer(batches, many=True)
         return Response(serializer.data)
     
@@ -353,8 +413,9 @@ class AnnotationBatchViewSet(viewsets.ModelViewSet):
         batch_size = request.data.get('batch_size', 10)
         overlap_count = request.data.get('overlap_count', 2)  # How many annotators per product
         
-        if batch_size not in [10, 20]:
-            return Response({"error": "batch_size must be 10 or 20"}, status=400)
+        allowed_sizes = [10, 15, 20, 25, 30]
+        if batch_size not in allowed_sizes:
+            return Response({"error": f"batch_size must be one of {allowed_sizes}"}, status=400)
         
         if overlap_count < 1 or overlap_count > 5:
             return Response({"error": "overlap_count must be between 1 and 5"}, status=400)
@@ -464,6 +525,10 @@ class AnnotationBatchViewSet(viewsets.ModelViewSet):
     def auto_process_all_batches(self, batch_size):
         """Automatically process all pending products in batches"""
         from .models import AIProcessingControl
+        # IMPORTANT: this runs in a background thread. Make sure this thread
+        # does not leak database connections by explicitly closing any
+        # inherited/old connections before and after the processing loop.
+        close_old_connections()
         try:
             while True:
                 # Check if processing is paused
@@ -510,11 +575,18 @@ class AnnotationBatchViewSet(viewsets.ModelViewSet):
                 
         except Exception as e:
             print(f"Error in auto_process_all_batches: {e}")
+        finally:
+            # Ensure any DB connections held by this worker thread are
+            # released back to Django/psycopg2 and do not consume slots.
+            close_old_connections()
     
     def process_ai_batch(self, batch_id, product_ids):
         """Process AI batch with proper error handling"""
         try:
-            thread = threading.Thread(target=self.simulate_ai_processing, args=(batch_id, product_ids))
+            thread = threading.Thread(
+                target=self.simulate_ai_processing,
+                args=(batch_id, product_ids),
+            )
             thread.daemon = True
             thread.start()
         except Exception as e:
@@ -526,11 +598,15 @@ class AnnotationBatchViewSet(viewsets.ModelViewSet):
     
     def simulate_ai_processing(self, batch_id, product_ids):
         """Simulate AI processing - replace with actual AI calls"""
+        # This method is executed inside a background thread created by
+        # process_ai_batch / auto_process_all_batches. We must ensure that
+        # any database connections used here are properly managed to avoid
+        # exhausting PostgreSQL connection slots.
+        close_old_connections()
         try:
             batch = AnnotationBatch.objects.get(id=batch_id)
             products = Product.objects.filter(id__in=product_ids)
             
-            attributes = list(Attribute.objects.all())
             ai_providers = list(AIProvider.objects.filter(is_active=True))
             
             print(f"Starting AI batch {batch_id} processing for {len(products)} products")
@@ -540,7 +616,11 @@ class AnnotationBatchViewSet(viewsets.ModelViewSet):
                 
                 time.sleep(2)  # Simulate processing time
                 
-                for attribute in attributes:
+                applicable_attributes = list(product.get_applicable_attributes())
+                if not applicable_attributes:
+                    continue
+                
+                for attribute in applicable_attributes:
                     for provider in ai_providers:
                         suggested_value = self.generate_ai_suggestion(product, attribute, provider)
                         confidence = round(random.uniform(0.7, 0.95), 4)
@@ -562,7 +642,7 @@ class AnnotationBatchViewSet(viewsets.ModelViewSet):
                     suggestions = AISuggestion.objects.filter(product=product, attribute=attribute)
                     if suggestions:
                         consensus_value = self.build_consensus(suggestions)
-                        AIConsensus.objects.create(
+                        AIConsensus.record(
                             product=product,
                             attribute=attribute,
                             consensus_value=consensus_value,
@@ -593,6 +673,10 @@ class AnnotationBatchViewSet(viewsets.ModelViewSet):
             except:
                 pass
             print(f"Background AI processing error: {e}")
+        finally:
+            # Close DB connections held by this thread so they do not linger
+            # after processing finishes.
+            close_old_connections()
     
     def generate_ai_suggestion(self, product, attribute, provider):
         """Generate realistic AI suggestions based on product information"""
@@ -828,6 +912,12 @@ class HumanAnnotationViewSet(viewsets.ModelViewSet):
                 attribute = Attribute.objects.get(id=data['attribute_id'])
                 batch_item = BatchItem.objects.get(id=data['batch_item_id'])
                 
+                if not _is_attribute_applicable(product, attribute.id):
+                    category_name = product.category.name if product.category else 'Uncategorized'
+                    return Response({
+                        "error": f"Attribute '{attribute.name}' is not applicable to category '{category_name}'"
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                
                 annotation, created = HumanAnnotation.objects.get_or_create(
                     product=product,
                     attribute=attribute,
@@ -847,7 +937,11 @@ class HumanAnnotationViewSet(viewsets.ModelViewSet):
                     annotation.save()
                 
                 try:
-                    ai_consensus = AIConsensus.objects.get(product=product, attribute=attribute)
+                    ai_consensus = AIConsensus.objects.get(
+                        product=product,
+                        attribute=attribute,
+                        is_active=True
+                    )
                     if ai_consensus.consensus_value != data['annotated_value']:
                         annotation.is_correction = True
                         annotation.previous_value = ai_consensus.consensus_value
@@ -914,12 +1008,13 @@ class AISuggestionViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
 class AIConsensusViewSet(viewsets.ModelViewSet):
-    queryset = AIConsensus.objects.all()
+    queryset = AIConsensus.objects.filter(is_active=True)
     serializer_class = AIConsensusSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+
 class FinalAttributeViewSet(viewsets.ModelViewSet):
-    queryset = FinalAttribute.objects.all()
+    queryset = FinalAttribute.objects.filter(is_active=True)
     serializer_class = FinalAttributeSerializer
     permission_classes = [permissions.IsAuthenticated & IsAdmin]
     
@@ -978,10 +1073,15 @@ class FinalAttributeViewSet(viewsets.ModelViewSet):
                         product=product,
                         status='approved'
                     )
+                    applicable_attr_ids = CategoryAttributeMapping.get_attribute_ids_for_product(product)
+                    if applicable_attr_ids:
+                        human_annotations = human_annotations.filter(attribute_id__in=applicable_attr_ids)
                     
                     if not human_annotations.exists():
                         # Check if there are any annotations at all
                         all_annotations = HumanAnnotation.objects.filter(product=product)
+                        if applicable_attr_ids:
+                            all_annotations = all_annotations.filter(attribute_id__in=applicable_attr_ids)
                         if all_annotations.exists():
                             errors.append(f"Product '{product.name}' has annotations but none are approved. Please ensure the batch is completed.")
                         else:
@@ -989,8 +1089,9 @@ class FinalAttributeViewSet(viewsets.ModelViewSet):
                         continue
                     
                     # Validate that all required attributes are annotated
-                    required_attributes = Attribute.objects.all()
                     annotated_attribute_ids = set(human_annotations.values_list('attribute_id', flat=True))
+                    required_attr_ids = _required_attribute_ids(product)
+                    required_attributes = Attribute.objects.filter(id__in=required_attr_ids)
                     missing_attributes = required_attributes.exclude(id__in=annotated_attribute_ids)
                     
                     if missing_attributes.exists():
@@ -1006,33 +1107,76 @@ class FinalAttributeViewSet(viewsets.ModelViewSet):
                             annotations_by_attr[attr_id] = []
                         annotations_by_attr[attr_id].append(annotation)
                     
+                    # Get conflict resolutions from request if provided
+                    conflict_resolutions = request.data.get('conflict_resolutions', {})
+                    # Format: { attribute_id: { 'type': 'annotator'|'ai'|'custom', 'value': ..., 'annotation_id': ... } }
+                    
                     # Finalize each attribute
                     for attr_id, annotations in annotations_by_attr.items():
-                        # If multiple annotators reviewed, take consensus or most common value
-                        if len(annotations) > 1:
-                            # Count values
-                            value_counts = {}
-                            for ann in annotations:
-                                value_counts[ann.annotated_value] = value_counts.get(ann.annotated_value, 0) + 1
-                            
-                            # Get most common value
-                            final_value = max(value_counts.items(), key=lambda x: x[1])[0]
-                            source = 'consensus'
-                        else:
-                            final_value = annotations[0].annotated_value
-                            source = 'human'
+                        attribute_obj = annotations[0].attribute
+                        final_value = None
+                        source = 'human'
                         
-                        # Create or update final attribute
-                        final_attr, created = FinalAttribute.objects.update_or_create(
-                            product=product,
-                            attribute_id=attr_id,
-                            defaults={
-                                'final_value': final_value,
-                                'source': source,
-                                'decided_by': request.user,
-                                'confidence_score': 1.0
-                            }
-                        )
+                        # Check if there's a conflict resolution for this attribute
+                        if str(attr_id) in conflict_resolutions or attr_id in conflict_resolutions:
+                            resolution = conflict_resolutions.get(str(attr_id)) or conflict_resolutions.get(attr_id)
+                            resolution_type = resolution.get('type')
+                            
+                            if resolution_type == 'annotator':
+                                # Use specific annotator's value
+                                annotation_id = resolution.get('annotation_id')
+                                selected_annotation = next(
+                                    (ann for ann in annotations if ann.id == annotation_id),
+                                    None
+                                )
+                                if selected_annotation:
+                                    final_value = selected_annotation.annotated_value
+                                    source = 'human'
+                            elif resolution_type == 'ai':
+                                # Use AI consensus value
+                                try:
+                                    ai_consensus = AIConsensus.objects.get(
+                                        product=product,
+                                        attribute_id=attr_id,
+                                        is_active=True
+                                    )
+                                    final_value = ai_consensus.consensus_value
+                                    source = 'ai'
+                                except AIConsensus.DoesNotExist:
+                                    # Fallback to most common value if AI consensus not available
+                                    value_counts = {}
+                                    for ann in annotations:
+                                        value_counts[ann.annotated_value] = value_counts.get(ann.annotated_value, 0) + 1
+                                    final_value = max(value_counts.items(), key=lambda x: x[1])[0]
+                                    source = 'consensus'
+                            elif resolution_type == 'custom':
+                                # Use custom value entered by admin
+                                final_value = resolution.get('value', '')
+                                source = 'human'
+                        else:
+                            # No resolution provided - use default logic
+                            if len(annotations) > 1:
+                                # Count values
+                                value_counts = {}
+                                for ann in annotations:
+                                    value_counts[ann.annotated_value] = value_counts.get(ann.annotated_value, 0) + 1
+                                
+                                # Get most common value
+                                final_value = max(value_counts.items(), key=lambda x: x[1])[0]
+                                source = 'consensus'
+                            else:
+                                final_value = annotations[0].annotated_value
+                                source = 'human'
+                        
+                        if final_value:
+                            FinalAttribute.record(
+                                product=product,
+                                attribute=attribute_obj,
+                                final_value=final_value,
+                                source=source,
+                                decided_by=request.user,
+                                confidence_score=1.0
+                            )
                     
                     # Mark product as finalized
                     product.status = 'finalized'
@@ -1078,6 +1222,119 @@ class FinalAttributeViewSet(viewsets.ModelViewSet):
             "products": serializer.data
         })
     
+    @action(detail=False, methods=['get'], permission_classes=[IsAdmin])
+    def check_conflicts(self, request):
+        """Check for conflicts in a product before finalization"""
+        product_id = request.query_params.get('product_id')
+        if not product_id:
+            return Response({"error": "product_id parameter is required"}, status=400)
+        
+        try:
+            product = Product.objects.get(id=product_id)
+            if product.status != 'reviewed':
+                return Response({
+                    "error": f"Product must be in 'reviewed' status. Current status: {product.status}"
+                }, status=400)
+            
+            # If product is in 'reviewed' status, automatically approve any 'suggested' annotations
+            # This matches the behavior in finalize_attributes and ensures we check the same annotations
+            if product.status == 'reviewed':
+                HumanAnnotation.objects.filter(
+                    product=product,
+                    status='suggested'
+                ).update(status='approved')
+            
+            # Get all approved human annotations for this product
+            human_annotations = HumanAnnotation.objects.filter(
+                product=product,
+                status='approved'
+            )
+            applicable_attr_ids = CategoryAttributeMapping.get_attribute_ids_for_product(product)
+            if applicable_attr_ids:
+                human_annotations = human_annotations.filter(attribute_id__in=applicable_attr_ids)
+            
+            # Group annotations by attribute
+            annotations_by_attr = {}
+            for annotation in human_annotations:
+                attr_id = annotation.attribute_id
+                if attr_id not in annotations_by_attr:
+                    annotations_by_attr[attr_id] = []
+                annotations_by_attr[attr_id].append(annotation)
+            
+            # Find conflicts (attributes with multiple different values)
+            conflicts = []
+            ai_consensus_by_attr = {}
+            
+            # Get AI consensus for all attributes
+            ai_consensus_list = AIConsensus.objects.filter(
+                product=product,
+                is_active=True
+            )
+            if applicable_attr_ids:
+                ai_consensus_list = ai_consensus_list.filter(attribute_id__in=applicable_attr_ids)
+            
+            for consensus in ai_consensus_list:
+                ai_consensus_by_attr[consensus.attribute_id] = {
+                    'id': consensus.id,
+                    'value': consensus.consensus_value,
+                    'confidence': float(consensus.confidence) if consensus.confidence else None,
+                    'attribute_name': consensus.attribute.name
+                }
+            
+            for attr_id, annotations in annotations_by_attr.items():
+                if len(annotations) > 1:
+                    # Check if there are different values (normalize by stripping whitespace)
+                    # This handles cases where values might be the same but have different whitespace
+                    normalized_values = set(
+                        ann.annotated_value.strip().lower() if ann.annotated_value else ''
+                        for ann in annotations
+                    )
+                    
+                    # Also check original values for display purposes
+                    original_values = set(ann.annotated_value for ann in annotations if ann.annotated_value)
+                    
+                    # There's a conflict if normalized values differ
+                    if len(normalized_values) > 1:
+                        # There's a conflict
+                        attribute = annotations[0].attribute
+                        conflict_data = {
+                            'attribute_id': attr_id,
+                            'attribute_name': attribute.name,
+                            'annotations': []
+                        }
+                        
+                        for ann in annotations:
+                            conflict_data['annotations'].append({
+                                'id': ann.id,
+                                'annotator_id': ann.annotator_id,
+                                'annotator_name': ann.annotator.username,
+                                'value': ann.annotated_value or ''
+                            })
+                        
+                        # Add AI consensus if available
+                        if attr_id in ai_consensus_by_attr:
+                            conflict_data['ai_consensus'] = ai_consensus_by_attr[attr_id]
+                        
+                        conflicts.append(conflict_data)
+            
+            return Response({
+                'has_conflicts': len(conflicts) > 0,
+                'conflicts': conflicts,
+                'product_id': product.id,
+                'product_name': product.name,
+                'total_annotations': human_annotations.count(),
+                'attributes_with_annotations': len(annotations_by_attr)
+            })
+            
+        except Product.DoesNotExist:
+            return Response({"error": "Product not found"}, status=404)
+        except Exception as e:
+            import traceback
+            return Response({
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }, status=500)
+    
     @action(detail=False, methods=['post'], permission_classes=[IsAdmin])
     def finalize_all_reviewed(self, request):
         """Finalize all products in reviewed status"""
@@ -1100,9 +1357,14 @@ class FinalAttributeViewSet(viewsets.ModelViewSet):
                         product=product,
                         status='approved'
                     )
+                    applicable_attr_ids = CategoryAttributeMapping.get_attribute_ids_for_product(product)
+                    if applicable_attr_ids:
+                        human_annotations = human_annotations.filter(attribute_id__in=applicable_attr_ids)
                     
                     if not human_annotations.exists():
                         all_annotations = HumanAnnotation.objects.filter(product=product)
+                        if applicable_attr_ids:
+                            all_annotations = all_annotations.filter(attribute_id__in=applicable_attr_ids)
                         if all_annotations.exists():
                             errors.append(f"Product '{product.name}' has annotations but none are approved.")
                         else:
@@ -1110,8 +1372,9 @@ class FinalAttributeViewSet(viewsets.ModelViewSet):
                         continue
                     
                     # Validate that all required attributes are annotated
-                    required_attributes = Attribute.objects.all()
                     annotated_attribute_ids = set(human_annotations.values_list('attribute_id', flat=True))
+                    required_attr_ids = _required_attribute_ids(product)
+                    required_attributes = Attribute.objects.filter(id__in=required_attr_ids)
                     missing_attributes = required_attributes.exclude(id__in=annotated_attribute_ids)
                     
                     if missing_attributes.exists():
@@ -1140,15 +1403,14 @@ class FinalAttributeViewSet(viewsets.ModelViewSet):
                             final_value = annotations[0].annotated_value
                             source = 'human'
                         
-                        FinalAttribute.objects.update_or_create(
+                        attribute_obj = annotations[0].attribute
+                        FinalAttribute.record(
                             product=product,
-                            attribute_id=attr_id,
-                            defaults={
-                                'final_value': final_value,
-                                'source': source,
-                                'decided_by': request.user,
-                                'confidence_score': 1.0
-                            }
+                            attribute=attribute_obj,
+                            final_value=final_value,
+                            source=source,
+                            decided_by=request.user,
+                            confidence_score=1.0
                         )
                     
                     product.status = 'finalized'
@@ -1186,45 +1448,104 @@ class FinalAttributeViewSet(viewsets.ModelViewSet):
         format_type = request.data.get('format', 'json')
         product_ids = request.data.get('product_ids', [])
         
+        final_attrs = FinalAttribute.objects.filter(product__status='finalized', is_active=True)
+        
         if product_ids:
-            final_attrs = FinalAttribute.objects.filter(product_id__in=product_ids)
-        else:
-            final_attrs = FinalAttribute.objects.all()
+            final_attrs = final_attrs.filter(product_id__in=product_ids)
+        
+        final_attrs = final_attrs.select_related('product', 'attribute', 'decided_by').order_by('product_id', 'attribute__name')
         
         if format_type == 'csv':
             response = HttpResponse(content_type='text/csv')
             response['Content-Disposition'] = 'attachment; filename="final_attributes.csv"'
             
             writer = csv.writer(response)
-            writer.writerow(['Product ID', 'Product Name', 'Attribute', 'Final Value', 'Source', 'Decided By', 'Confidence'])
+            writer.writerow([
+                'Product ID',
+                'External SKU',
+                'Product Name',
+                'Description',
+                'Category',
+                'Subcategory',
+                'Price',
+                'Status',
+                'Image URLs',
+                'Created At',
+                'Updated At',
+                'Attribute ID',
+                'Attribute Name',
+                'Final Value',
+                'Source',
+                'Decided By',
+                'Confidence',
+                'Finalized At',
+            ])
             
             for attr in final_attrs:
+                product = attr.product
+                category_name = product.category.name if product.category else ''
+                subcategory_name = product.subcategory.name if product.subcategory else ''
                 writer.writerow([
-                    attr.product.id,
-                    attr.product.name,
+                    product.id,
+                    product.external_sku or '',
+                    product.name,
+                    product.description or '',
+                    category_name,
+                    subcategory_name,
+                    str(product.price) if product.price is not None else '',
+                    product.status,
+                    '|'.join(product.image_urls or []),
+                    product.created_at.isoformat(),
+                    product.updated_at.isoformat(),
+                    attr.attribute.id,
                     attr.attribute.name,
                     attr.final_value,
                     attr.source,
                     attr.decided_by.username if attr.decided_by else '',
-                    float(attr.confidence_score) if attr.confidence_score else ''
+                    float(attr.confidence_score) if attr.confidence_score else '',
+                    attr.created_at.isoformat(),
                 ])
             
             return response
         else:
             # JSON format
             data = []
+            products_map = {}
+            
             for attr in final_attrs:
-                data.append({
-                    'product_id': attr.product.id,
-                    'product_name': attr.product.name,
+                product = attr.product
+                
+                if product.id not in products_map:
+                    category_name = product.category.name if product.category else None
+                    subcategory_name = product.subcategory.name if product.subcategory else None
+                    products_map[product.id] = {
+                        'product': {
+                            'id': product.id,
+                            'external_sku': product.external_sku,
+                            'name': product.name,
+                            'description': product.description,
+                            'category': category_name,
+                            'subcategory': subcategory_name,
+                            'price': str(product.price) if product.price is not None else None,
+                            'status': product.status,
+                            'image_urls': product.image_urls or [],
+                            'created_at': product.created_at.isoformat(),
+                            'updated_at': product.updated_at.isoformat(),
+                        },
+                        'final_attributes': []
+                    }
+                
+                products_map[product.id]['final_attributes'].append({
                     'attribute_id': attr.attribute.id,
                     'attribute_name': attr.attribute.name,
                     'final_value': attr.final_value,
                     'source': attr.source,
                     'decided_by': attr.decided_by.username if attr.decided_by else None,
                     'confidence_score': float(attr.confidence_score) if attr.confidence_score else None,
-                    'created_at': attr.created_at.isoformat()
+                    'finalized_at': attr.created_at.isoformat()
                 })
+            
+            data = list(products_map.values())
             
             response = HttpResponse(json.dumps(data, indent=2), content_type='application/json')
             response['Content-Disposition'] = 'attachment; filename="final_attributes.json"'
@@ -1247,22 +1568,14 @@ class FinalAttributeViewSet(viewsets.ModelViewSet):
                     attribute_id=data['attribute_id']
                 )
                 
-                final_attr, created = FinalAttribute.objects.get_or_create(
+                FinalAttribute.record(
                     product=overlap.product,
                     attribute=overlap.attribute,
-                    defaults={
-                        'final_value': data['resolved_value'],
-                        'source': 'consensus',
-                        'decided_by': request.user,
-                        'confidence_score': 0.95
-                    }
+                    final_value=data['resolved_value'],
+                    source='consensus',
+                    decided_by=request.user,
+                    confidence_score=0.95
                 )
-                
-                if not created:
-                    final_attr.final_value = data['resolved_value']
-                    final_attr.source = 'consensus'
-                    final_attr.decided_by = request.user
-                    final_attr.save()
                 
                 overlap.resolved_value = data['resolved_value']
                 overlap.resolved_by = request.user
@@ -1360,7 +1673,9 @@ class DashboardViewSet(viewsets.ViewSet):
             
             # AI accuracy: compare AI consensus with human annotations
             # Get all product-attribute pairs where both AI consensus and human annotations exist
-            ai_consensus_attrs = set(AIConsensus.objects.values_list('product_id', 'attribute_id').distinct())
+            ai_consensus_attrs = set(
+                AIConsensus.objects.filter(is_active=True).values_list('product_id', 'attribute_id').distinct()
+            )
             human_annotation_attrs = set(HumanAnnotation.objects.values_list('product_id', 'attribute_id').distinct())
             
             # Find overlapping product-attribute pairs
@@ -1370,7 +1685,11 @@ class DashboardViewSet(viewsets.ViewSet):
             
             for product_id, attribute_id in overlapping_pairs:
                 try:
-                    ai_consensus = AIConsensus.objects.get(product_id=product_id, attribute_id=attribute_id)
+                    ai_consensus = AIConsensus.objects.get(
+                        product_id=product_id,
+                        attribute_id=attribute_id,
+                        is_active=True
+                    )
                     human_annotations = HumanAnnotation.objects.filter(
                         product_id=product_id, 
                         attribute_id=attribute_id
@@ -1479,7 +1798,8 @@ class DashboardViewSet(viewsets.ViewSet):
             try:
                 ai_consensus = AIConsensus.objects.get(
                     product=annotation.product,
-                    attribute=annotation.attribute
+                    attribute=annotation.attribute,
+                    is_active=True
                 )
                 if ai_consensus.consensus_value != annotation.annotated_value:
                     changes += 1
@@ -1523,6 +1843,12 @@ class MissingValueFlagViewSet(viewsets.ModelViewSet):
                 product = Product.objects.get(id=data['product_id'])
                 attribute = Attribute.objects.get(id=data['attribute_id'])
                 batch_item = BatchItem.objects.get(id=data['batch_item_id'])
+                
+                if not _is_attribute_applicable(product, attribute.id):
+                    category_name = product.category.name if product.category else 'Uncategorized'
+                    return Response({
+                        "error": f"Attribute '{attribute.name}' is not applicable to category '{category_name}'"
+                    }, status=status.HTTP_400_BAD_REQUEST)
                 
                 flag, created = MissingValueFlag.objects.get_or_create(
                     product=product,

@@ -2,6 +2,13 @@ from rest_framework import serializers
 from django.contrib.auth.models import User, Group
 from .models import *
 
+
+def _applicable_attribute_ids(product):
+    if not product:
+        return None
+    attr_ids = CategoryAttributeMapping.get_attribute_ids_for_product(product)
+    return attr_ids or None
+
 class UserSerializer(serializers.ModelSerializer):
     role = serializers.SerializerMethodField()
     
@@ -19,6 +26,8 @@ class UserSerializer(serializers.ModelSerializer):
 class ProductSerializer(serializers.ModelSerializer):
     image_urls = serializers.ListField(child=serializers.URLField(), required=False)
     primary_image = serializers.SerializerMethodField()
+    category_name = serializers.CharField(source='category.name', read_only=True)
+    subcategory_name = serializers.CharField(source='subcategory.name', read_only=True)
     
     class Meta:
         model = Product
@@ -155,6 +164,7 @@ class BatchItemSerializer(serializers.ModelSerializer):
     ai_suggestions = serializers.SerializerMethodField()
     ai_consensus = serializers.SerializerMethodField()
     human_annotations = serializers.SerializerMethodField()
+    applicable_attributes = serializers.SerializerMethodField()
     
     class Meta:
         model = BatchItem
@@ -162,31 +172,63 @@ class BatchItemSerializer(serializers.ModelSerializer):
     
     def get_ai_suggestions(self, obj):
         suggestions = AISuggestion.objects.filter(product=obj.product)
+        attr_ids = _applicable_attribute_ids(obj.product)
+        if attr_ids:
+            suggestions = suggestions.filter(attribute_id__in=attr_ids)
         return AISuggestionSerializer(suggestions, many=True).data
     
     def get_ai_consensus(self, obj):
-        consensus = AIConsensus.objects.filter(product=obj.product)
+        consensus = AIConsensus.objects.filter(product=obj.product, is_active=True)
+        attr_ids = _applicable_attribute_ids(obj.product)
+        if attr_ids:
+            consensus = consensus.filter(attribute_id__in=attr_ids)
         return AIConsensusSerializer(consensus, many=True).data
     
     def get_human_annotations(self, obj):
         annotations = HumanAnnotation.objects.filter(batch_item=obj)
+        attr_ids = _applicable_attribute_ids(obj.product)
+        if attr_ids:
+            annotations = annotations.filter(attribute_id__in=attr_ids)
         return HumanAnnotationSerializer(annotations, many=True).data
-
-class AnnotationBatchSerializer(serializers.ModelSerializer):
-    items = BatchItemSerializer(many=True, read_only=True)
-    assigned_to_name = serializers.CharField(source='assigned_to.username', read_only=True)
-    item_count = serializers.SerializerMethodField()
-    completed_count = serializers.SerializerMethodField()
     
+    def get_applicable_attributes(self, obj):
+        attributes = obj.product.get_applicable_attributes()
+        return AttributeSerializer(attributes, many=True).data
+
+class BaseBatchSerializer(serializers.ModelSerializer):
+    assigned_to_name = serializers.CharField(source='assigned_to.username', read_only=True)
+    item_count = serializers.IntegerField(read_only=True)
+    completed_count = serializers.IntegerField(read_only=True)
+
     class Meta:
         model = AnnotationBatch
-        fields = '__all__'
-    
-    def get_item_count(self, obj):
-        return obj.items.count()
-    
-    def get_completed_count(self, obj):
-        return obj.items.filter(status='done').count()
+        fields = [
+            'id',
+            'name',
+            'description',
+            'batch_type',
+            'batch_size',
+            'status',
+            'progress',
+            'assigned_to',
+            'assigned_to_name',
+            'item_count',
+            'completed_count',
+            'parent_batch',
+            'created_at',
+            'updated_at',
+        ]
+
+class AnnotationBatchSummarySerializer(BaseBatchSerializer):
+    """Lightweight serializer used for dashboards and list views."""
+    class Meta(BaseBatchSerializer.Meta):
+        fields = BaseBatchSerializer.Meta.fields
+
+
+class AnnotationBatchSerializer(BaseBatchSerializer):
+    items = BatchItemSerializer(many=True, read_only=True)
+    class Meta(BaseBatchSerializer.Meta):
+        fields = BaseBatchSerializer.Meta.fields + ['items']
 
 class HumanAnnotationSerializer(serializers.ModelSerializer):
     attribute_name = serializers.CharField(source='attribute.name', read_only=True)
@@ -209,7 +251,11 @@ class HumanAnnotationSerializer(serializers.ModelSerializer):
     
     def get_ai_suggested_value(self, obj):
         try:
-            consensus = AIConsensus.objects.get(product=obj.product, attribute=obj.attribute)
+            consensus = AIConsensus.objects.get(
+                product=obj.product,
+                attribute=obj.attribute,
+                is_active=True
+            )
             return consensus.consensus_value
         except AIConsensus.DoesNotExist:
             return None
@@ -234,6 +280,9 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     primary_image = serializers.SerializerMethodField()
     batch_info = serializers.SerializerMethodField()
     overlap_data = serializers.SerializerMethodField()
+    applicable_attributes = serializers.SerializerMethodField()
+    category_name = serializers.CharField(source='category.name', read_only=True)
+    subcategory_name = serializers.CharField(source='subcategory.name', read_only=True)
     
     class Meta:
         model = Product
@@ -241,18 +290,30 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     
     def get_ai_suggestions(self, obj):
         suggestions = AISuggestion.objects.filter(product=obj)
+        attr_ids = _applicable_attribute_ids(obj)
+        if attr_ids:
+            suggestions = suggestions.filter(attribute_id__in=attr_ids)
         return AISuggestionSerializer(suggestions, many=True).data
     
     def get_ai_consensus(self, obj):
-        consensus = AIConsensus.objects.filter(product=obj)
+        consensus = AIConsensus.objects.filter(product=obj, is_active=True)
+        attr_ids = _applicable_attribute_ids(obj)
+        if attr_ids:
+            consensus = consensus.filter(attribute_id__in=attr_ids)
         return AIConsensusSerializer(consensus, many=True).data
     
     def get_human_annotations(self, obj):
         annotations = HumanAnnotation.objects.filter(product=obj)
+        attr_ids = _applicable_attribute_ids(obj)
+        if attr_ids:
+            annotations = annotations.filter(attribute_id__in=attr_ids)
         return HumanAnnotationSerializer(annotations, many=True).data
     
     def get_final_attributes(self, obj):
-        final_attrs = FinalAttribute.objects.filter(product=obj)
+        final_attrs = FinalAttribute.objects.filter(product=obj, is_active=True)
+        attr_ids = _applicable_attribute_ids(obj)
+        if attr_ids:
+            final_attrs = final_attrs.filter(attribute_id__in=attr_ids)
         return FinalAttributeSerializer(final_attrs, many=True).data
     
     def get_primary_image(self, obj):
@@ -284,6 +345,10 @@ class ProductDetailSerializer(serializers.ModelSerializer):
                 'overlap_id': overlap.id
             })
         return overlap_data
+    
+    def get_applicable_attributes(self, obj):
+        attributes = obj.get_applicable_attributes()
+        return AttributeSerializer(attributes, many=True).data
 
 class AnnotationSubmitSerializer(serializers.Serializer):
     product_id = serializers.IntegerField()
